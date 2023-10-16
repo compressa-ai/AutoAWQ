@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import awq_inference_engine  # with CUDA kernels
+from torch.autograd import Function
 
 
 def make_divisible(c, divisor):
@@ -20,6 +21,71 @@ def calculate_zeros_width(in_features, group_size=128, pack_num=8):
     base_width = make_divisible(in_features // group_size, pack_num)
     base_width = make_divisible(base_width, size_multiplier) * size_multiplier
     return base_width
+
+
+class WQLinearMVFunction(Function):
+    @staticmethod
+    # ctx is the first argument to forward
+    def forward(ctx, x, qweight, qzeros, scales, group_size, split_k_iters, bias=None, out_features=0):
+        # The forward pass can use ctx.
+        ctx.save_for_backward(x, qweight, qzeros, scales, bias)
+        ctx.out_features = out_features
+
+        out_shape = x.shape[:-1] + (out_features, )
+        x = x.to(torch.float16)
+        inputs = x.reshape(-1, x.shape[-1])
+        
+        if inputs.shape[0] > 8:
+            out = awq_inference_engine.gemmv2_forward_cuda(inputs, qweight, scales, qzeros, group_size, split_k_iters)
+        else:
+            out = awq_inference_engine.gemv_forward_cuda(inputs, qweight, scales, qzeros, group_size)
+        
+        out = out + bias if bias is not None else out
+        return out.reshape(out_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, qweight, qzeros, scales, bias = ctx.saved_tensors
+        out_features = ctx.out_features
+        grad_input = grad_weight = grad_zeros = grad_scales = grad_bias = grad_out_features = None
+        weight = awq_inference_engine.dequantize_weights_cuda(qweight, scales, qzeros, 1, 0, 0, False)
+
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output[0].mm(weight.t()).unsqueeze(0)
+        if bias is not None and ctx.needs_input_grad[4]:
+            grad_bias = grad_output.sum(0)
+
+        return grad_input, grad_weight, grad_zeros, grad_scales, grad_bias, grad_out_features
+
+class WQLinearMMFunction(Function):
+    @staticmethod
+    # ctx is the first argument to forward
+    def forward(ctx, x, qweight, qzeros, scales, bias=None, out_features=0):
+        # The forward pass can use ctx.
+        ctx.save_for_backward(x, qweight, qzeros, scales, bias)
+        ctx.out_features = out_features
+
+        out_shape = x.shape[:-1] + (out_features, )
+        x = x.to(torch.float16)
+        
+        out = awq_inference_engine.gemm_forward_cuda(x.reshape(-1, x.shape[-1]), qweight, scales, qzeros, 8)
+        out = out + bias if bias is not None else out
+
+        return out.reshape(out_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, qweight, qzeros, scales, bias = ctx.saved_tensors
+        out_features = ctx.out_features
+        grad_input = grad_weight = grad_zeros = grad_scales = grad_bias = grad_out_features = None
+        weight = awq_inference_engine.dequantize_weights_cuda(qweight, scales, qzeros, 1, 0, 0, False)
+
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output[0].mm(weight.t()).unsqueeze(0)
+        if bias is not None and ctx.needs_input_grad[4]:
+            grad_bias = grad_output.sum(0)
+
+        return grad_input, grad_weight, grad_zeros, grad_scales, grad_bias, grad_out_features
 
 class WQLinear_GEMM(nn.Module):
     def __init__(self, w_bit, group_size, in_features, out_features, bias, dev):
@@ -94,12 +160,15 @@ class WQLinear_GEMM(nn.Module):
         
         return awq_linear
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    # def forward(self, x):
+    #     out_shape = x.shape[:-1] + (self.out_features, )
+    #     out = awq_inference_engine.gemm_forward_cuda(x.reshape(-1, x.shape[-1]), self.qweight, self.scales, self.qzeros, 8)
+    #     out = out + self.bias if self.bias is not None else out
+    #     return out.reshape(out_shape)
+
     def forward(self, x):
-        out_shape = x.shape[:-1] + (self.out_features, )
-        out = awq_inference_engine.gemm_forward_cuda(x.reshape(-1, x.shape[-1]), self.qweight, self.scales, self.qzeros, 8)
-        out = out + self.bias if self.bias is not None else out
-        return out.reshape(out_shape)
+        return WQLinearMMFunction.apply(x, self.qweight, self.qzeros, self.scales, self.bias, self.out_features)
     
     def extra_repr(self) -> str:
         return 'in_features={}, out_features={}, bias={}, w_bit={}, group_size={}'.format(
@@ -191,18 +260,21 @@ class WQLinear_GEMV(nn.Module):
         awq_linear.qzeros = qzeros
         return awq_linear
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    # def forward(self, x):
+    #     out_shape = x.shape[:-1] + (self.out_features, )
+    #     inputs = x.reshape(-1, x.shape[-1])
+        
+    #     if inputs.shape[0] > 8:
+    #         out = awq_inference_engine.gemmv2_forward_cuda(inputs, self.qweight, self.scales, self.qzeros, self.group_size, self.split_k_iters)
+    #     else:
+    #         out = awq_inference_engine.gemv_forward_cuda(inputs, self.qweight, self.scales, self.qzeros, self.group_size)
+        
+    #     out = out + self.bias if self.bias is not None else out
+    #     return out.reshape(out_shape)
+    
     def forward(self, x):
-        out_shape = x.shape[:-1] + (self.out_features, )
-        inputs = x.reshape(-1, x.shape[-1])
-        
-        if inputs.shape[0] > 8:
-            out = awq_inference_engine.gemmv2_forward_cuda(inputs, self.qweight, self.scales, self.qzeros, self.group_size, self.split_k_iters)
-        else:
-            out = awq_inference_engine.gemv_forward_cuda(inputs, self.qweight, self.scales, self.qzeros, self.group_size)
-        
-        out = out + self.bias if self.bias is not None else out
-        return out.reshape(out_shape)
+        return WQLinearMVFunction.apply(x, self.qweight, self.qzeros, self.scales, self.group_size, self.split_k_iters, self.bias, self.out_features)
     
     def extra_repr(self) -> str:
         return 'in_features={}, out_features={}, bias={}, w_bit={}, group_size={}'.format(
