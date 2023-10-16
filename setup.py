@@ -82,7 +82,7 @@ def get_compute_capabilities():
             raise RuntimeError("GPUs with compute capability less than 7.5 are not supported.")
 
     # figure out compute capability
-    compute_capabilities = {75, 80, 86, 89, 90}
+    compute_capabilities = {75, 80} #, 86, 89, 90}
 
     capability_flags = []
     for cap in compute_capabilities:
